@@ -1,62 +1,97 @@
-// Package wandb is the library behind the wandb command line:
-// the HTTP client, request shaping, and the typed data models for wandb.
+// Package wandb is the library behind the wandb command: the HTTP client,
+// GraphQL request shaping, and the typed data models for the Weights & Biases
+// public GraphQL API.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The public API at api.wandb.ai/graphql is open for reading public workspace
+// views (reports), entity profiles, and project metadata -- no API key required.
 package wandb
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to wandb. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
+// DefaultUserAgent identifies the client to W&B.
 const DefaultUserAgent = "wandb/dev (+https://github.com/tamnd/wandb-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at wandb.com; change it once you
-// know the real endpoints you want to read.
-const Host = "wandb.com"
+// Host is the site this client targets.
+const Host = "wandb.ai"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// APIEndpoint is the W&B GraphQL endpoint.
+const APIEndpoint = "https://api.wandb.ai/graphql"
 
-// Client talks to wandb over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// ErrNotFound is returned when a query returns null data for a single-record lookup.
+var ErrNotFound = errors.New("not found")
+
+// ErrServerError is returned on a GraphQL panic response.
+var ErrServerError = errors.New("server error")
+
+// ErrRateLimited is returned after exhausting retries on HTTP 429.
+var ErrRateLimited = errors.New("rate limited")
+
+// Config holds constructor parameters for Client.
+type Config struct {
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible defaults for the W&B API.
+func DefaultConfig() Config {
+	return Config{
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      300 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client is a rate-limited GraphQL client for the W&B public API.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client configured with cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// gqlRequest is the JSON body for a GraphQL POST.
+type gqlRequest struct {
+	Query     string         `json:"query"`
+	Variables map[string]any `json:"variables,omitempty"`
+}
+
+// gqlResponse is the envelope returned by the GraphQL API.
+type gqlResponse struct {
+	Data   json.RawMessage `json:"data"`
+	Errors []gqlError      `json:"errors,omitempty"`
+}
+
+type gqlError struct {
+	Message string `json:"message"`
+	Path    []any  `json:"path,omitempty"`
+}
+
+// postGQL sends a GraphQL query and returns the raw data field.
+func (c *Client) postGQL(ctx context.Context, query string, variables map[string]any) (json.RawMessage, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,55 +99,86 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		data, retry, err := c.doGQL(ctx, query, variables)
 		if err == nil {
-			return body, nil
+			return data, nil
 		}
 		lastErr = err
 		if !retry {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("graphql: %w", lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) doGQL(ctx context.Context, query string, variables map[string]any) (json.RawMessage, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+
+	body, err := json.Marshal(gqlRequest{Query: query, Variables: variables})
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
 
-	resp, err := c.HTTP.Do(req)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, APIEndpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, false, err
+	}
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, true, ErrRateLimited
+	}
+	if resp.StatusCode >= 500 {
 		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
 
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	if err != nil {
 		return nil, true, err
 	}
-	return b, false, nil
+
+	var gr gqlResponse
+	if err := json.Unmarshal(b, &gr); err != nil {
+		return nil, false, fmt.Errorf("decode graphql response: %w", err)
+	}
+
+	// GraphQL errors: server panics or schema mismatches.
+	if len(gr.Errors) > 0 {
+		msg := gr.Errors[0].Message
+		if strings.Contains(msg, "panic occurred") {
+			return nil, false, ErrServerError
+		}
+		return nil, false, fmt.Errorf("graphql: %s", msg)
+	}
+
+	return gr.Data, false, nil
 }
 
 // pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	c.mu.Lock()
+	wait := c.cfg.Rate - time.Since(c.last)
+	c.mu.Unlock()
+	if wait > 0 {
 		time.Sleep(wait)
 	}
+	c.mu.Lock()
 	c.last = time.Now()
+	c.mu.Unlock()
 }
 
 func backoff(attempt int) time.Duration {
@@ -121,80 +187,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on wandb.com. It is a stand-in for the typed records you
-// will model from the real wandb endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `wandb cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
