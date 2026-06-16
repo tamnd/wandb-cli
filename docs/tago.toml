@@ -1,0 +1,10 @@
+title       = "wandb"
+baseURL     = "https://wandb-cli.tamnd.com/"
+description = "Browse Weights and Biases public reports and runs"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/wandb-cli"
